@@ -1,0 +1,210 @@
+#!/bin/bash
+function derive {
+	PASSWORD=$1
+	SHA512=$(echo -n $PASSWORD|openssl dgst -sha512 -binary|xxd -c 512 -p)
+	echo "SHA512:$SHA512"
+	SHA256=$(echo -n $SHA512|xxd -r -p|openssl dgst -sha256 -binary|xxd -c 256 -p)
+	echo "SHA256:$SHA256"
+	EXTKEY="80$SHA256"
+	CHECKSUM=$(echo -n $EXTKEY|xxd -r -p|openssl dgst -sha256 -binary|openssl dgst -sha256 -binary|xxd -c 256 -p|head -c 8)
+	echo "CHECKSUM:$CHECKSUM"
+	export WIF=$(echo -n $EXTKEY$CHECKSUM|xxd -r -p|base58)
+	echo "WIF:$WIF"
+	evenbit=$(echo -n -e 02)
+	oddbit=$(echo -n -e 03)
+	SHA256=$(echo -n $WIF|base58 -d|xxd -p -c 80|tail -c +3|head -c -9)
+	echo "SHA256:$SHA256"
+	export UPK=$(openssl ec -inform DER -text -noout -in <(cat <(echo -n "302e0201010420") <(echo -n $SHA256) <(echo -n "a00706052b8104000a") | xxd -r -p) 2>/dev/null | tail -6 | head -5 | sed 's/[ :]//g' | tr -d '\n' && echo)
+	echo "Uncompressed_Public_Key:$UPK"
+	export CPK=$(echo -n $UPK|tail -c +3|head -c 64)
+	echo "X:$CPK"
+	endbit=$(echo -n $UPK|tail -c 2)
+	echo  "Endbit_is:$endbit"
+	if [[ "$endbit" =~ [02468ACE]$ ]] 
+	then CPK="$evenbit$CPK"
+	else CPK="$oddbit$CPK"
+	fi
+	echo "Compressed_Public_Key:$CPK"
+	#H1=$(echo -n $CPK|openssl dgst -sha256 -binary|xxd -c 256 -p)
+	#echo "hash1:$H1"
+	H2=$(echo -n $CPK|xxd -r -p|openssl dgst -rmd160 -binary|xxd -p)
+	#echo "hash2:$H2"
+	#H3=$(echo -n $H2|openssl dgst -rmd160 -binary|xxd -c 160 -p)
+	#echo "hash3:$H3"
+	CHECKSUM=$(echo -n $H2|head -c 8)
+	echo "checksum:$CHECKSUM"
+	export address=$(echo -n $CPK$CHECKSUM|xxd -r -p|base58)
+	echo "Baseaddress:$address"
+	echo "EOSaddress:EOS$address"
+	echo "BTSaddress:BTS$address"
+	echo "PPYaddress:PPY$address"
+	echo "STEEMaddress:STEEM$address"
+}
+# Converts the Hex given to little endians
+function toLittleEndian {
+echo "$1"|tac -rs ..|echo "$(tr -d '\n')"
+}
+# SLIPS specifications has the split hashes converted to little endian, and 
+# and then converted to unsigned longs to be used in the creation of the path
+function makeHexToDecimals {
+	local littleEndian=$(toLittleEndian $1)
+	printf "%u" "0x$littleEndian"
+}
+# As per SLIPS specifications, hashes get split from a 256bit hash to 128 bit,
+# then that 128bit is split into 4 equal hex values
+function splitHash {
+	local _128bitHash=$(echo $1|head -c 32)
+	local retval=(0,0,0,0)
+	for i in {0..3..1}
+	do
+		#$(echo $_128bithash|head -c $(expr $i \* 8)|tail -c $(echo "+"$(expr $i \* 8)))
+		if (($i == 0))
+		then
+			retval[$i]=$(echo $_128bitHash|tail -c +0|head -c 8)
+		else
+			retval[$i]=$(echo $_128bitHash|tail -c +$(expr  1 + \( 8  \* $i \) )|head -c 8)
+		fi
+	done
+	echo "${retval[*]}"
+	}
+# hardends the path
+function hardenPath {
+	local retval=("$@")
+	local hardened=$(printf "%u" "0x80000000")
+	if [ "$verbose" = true ];then
+		echo  "hardenedLong:$hardened"
+	fi
+	for i in {0..1..1}
+	do
+		local tmpHard=$(expr ${retval["$i"]} + $hardened)
+		#if the number is more than unsigned 32 bit long, the trezor firmware throws an error
+		if (($tmpHard <= 4294967295));
+		then
+		retval[$i]=$(expr ${retval["$i"]} + $hardened)
+		fi
+	done
+	echo "${retval[*]}"
+}
+# derives the slip path
+function derivePath {
+	hasharray=(`splitHash $1`)
+	#echo "${hasharray[*]}"
+	retpath=(0,0,0,0)
+	for i in {0..3..1}
+	do
+		#echo "i:$i:hasharray[$i]:${hasharray[$i]}"
+		retpath[$i]=$(makeHexToDecimals ${hasharray[$i]})
+	done
+	echo "${retpath[*]}"
+	hardendPath=(`hardenPath ${retpath[@]}`)
+	#echo "${hardendPath[*]}"
+	hardened=$(printf "%u" "0x80000000")
+	echo "m/$(expr 13 + $hardened)'/${hardendPath[0]}'/${hardendPath[1]}'/${hardendPath[2]}'/${hardendPath[3]}'"
+}
+
+#prints out the help message; default result if there is a problem
+function usage {
+	echo "Usage: graphene-trezor [OPTIONS] ACCOUNTNAME NETWORK"
+	echo ""
+	echo "Options:"
+	echo -e "-v, --verbose\t\t\tShow all the messages and calculations"
+	echo -e "-h, --help\t\t\tShow this message and exit"
+	echo -e "-x, --extended\t\t\tGets the Owner,Active,and Memo keys"
+	echo -e "-a, --active\t\t\tGets just the Active keys"
+	echo -e "-o, --owner\t\t\tGets just the Owner keys"
+	echo -e "-p, --posting\t\t\tGets a posting key, for steem networks"
+	echo -e "-b, --blocksigning\t\tGenerates a block signing key, requires an index to follow"
+}
+function hashKey {
+	local keyType=${2:-$(echo owner)}
+	local derived=(`derive $1`)
+	if [ "$verbose" = true ];then
+		printf "%s\n" ${derived[*]}
+	fi
+	local PublicBaseAddress=$(echo ${derived[10]}|tail -c +13)
+	echo $keyType"PrivateKey:$(echo ${derived[3]}|tail -c +5)"
+	echo $keyType"PublicKey:$(echo ${derived[8]}|tail -c +23)"
+	echo $keyType"PublicBaseAddress:$PublicBaseAddress"
+	echo $keyType"Public"$network"Address:$network$PublicBaseAddress"
+}
+function hashAccount {
+	local accountType=${1:-$(echo owner)}
+	echo "*********************************************************************************"
+	echo "**                                    "$accountType
+	echo "*********************************************************************************"
+	local message=$(echo -e "$network://$accountType@$username")
+	echo $message
+	local shahash=$(echo $message|openssl dgst --sha256 --binary|xxd -c 16 -p)
+	local path=(`derivePath $shahash`)
+	echo "path:${path[4]}"
+	echo "trezorctl sign-message -n ${path[4]} $message"
+	accountTypehash=$(trezorctl sign-message -n ${path[4]} $message)
+	accountTypehash=($accountTypehash)
+	parsedhash=$(echo "${accountTypehash[5]:2:-1}")
+	echo $accountType"hash:$parsedhash"
+	hashKey $parsedhash $accountType
+}
+extended=false
+verbose=false
+active=false
+owner=false
+posting=false
+blocksigningIndex=0
+#main loop
+while true $# -gt 0;do
+	case "$1" in
+		-h|--help)
+			usage
+			exit 0;;
+		-v|--verbose)
+			verbose=true
+			shift;;
+		-e|--extended)
+			extended=true
+			shift;;
+		-a|--active)
+			active=true
+			shift;;
+		-o|--owner)
+			owner=true
+			shift;;
+		-b|--blocksigning)
+			shift
+			blocksigningIndex=$1
+			shift;;
+		-p|--posting)
+			posting=true
+			shift;;
+		*)
+		break;;
+	esac
+done
+if [ -z "$1" ] || [ -z "$2" ];then
+	usage
+	exit 1;
+fi
+username=${1:-$(echo testusername)}
+network=${2:-$(echo "EOS")}
+agentcmd=$(echo $network:$username)
+if [ $blocksigningIndex -gt 0 ];then
+	hashAccount $(echo "blocksigning"$blocksigningIndex)
+	exit 0;
+elif [ "$active" = true ];then
+	hashAccount "active"
+	exit 0;
+elif [ "$owner" = true ];then
+	hashAccount "owner"
+	exit 0;
+elif [ "$posting" = true ];then
+	hashAccount "posting"
+	exit 0;
+else
+	hashAccount "owner"
+	hashAccount "active"
+	if $extended; then
+		hashAccount "memo"
+	fi
+fi
+
+
+
